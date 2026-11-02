@@ -1,0 +1,8 @@
+lid9 1.0.0
+abis:      arm64-v8a armeabi-v7a x86_64
+built:     2026-08-24T03:53:35Z
+
+Languages: english hindi telugu tamil kannada malayalam marathi bengali gujarati
+
+See NOTICE — the embedded model is Apache-2.0 and requires attribution when
+redistributed, including inside an APK.
