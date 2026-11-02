@@ -6,7 +6,7 @@ WORKDIR /build
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-COPY python/ ./python/
+COPY lid9/ ./lid9/
 
 # ---- Stage 2: Runtime ----
 FROM python:3.11-slim
@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY --from=builder /install /usr/local
-COPY --from=builder /build/python/lid9/ ./lid9/
+COPY --from=builder /build/lid9/ ./lid9/
 COPY server.py .
 
 EXPOSE 8000
