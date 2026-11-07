@@ -1,0 +1,385 @@
+name: GCP Build, Push & Deploy
+
+# speech_lid runs as Cloud Run service stt-lid, same pipeline as CB_STT_<language>.
+# Every push / pull request: build the image, smoke-test it, generate its SBOM
+# (Syft) and scan the SBOM for vulnerabilities (Grype - fails on fixable
+# CRITICAL findings).
+# Push to develop only: push the image to Artifact Registry as
+# develop-<short sha>, then deploy it to Cloud Run (job "deploy", environment
+# "production" on the production deploy job only). Cloud Run moves
+# traffic only once the new revision passes its startup probe; if the public
+# health check then fails, traffic goes back to the previous revision.
+#
+# Actions: GitHub-owned or Marketplace "verified creator" only, pinned to a
+# commit SHA (tags can be moved).
+#
+# Repo Settings -> Secrets and variables -> Actions:
+#   staging (push to develop):  vars STAGE_GCP_PROJECT_ID, STAGE_GCP_REGION, STAGE_GAR_REPOSITORY,
+#     STAGE_IMAGE_NAME, STAGE_CLOUD_RUN_SERVICE, STAGE_STT_HEALTH_URL, STAGE_STT_ALLOWED_ORIGIN,
+#     secrets STAGE_GCP_WIF_PROVIDER, STAGE_GCP_DEPLOY_SA
+#   production (manual run, main only): the same names with PROD_
+#
+# Production builds `commit` (blank = HEAD) as prod-<sha> and deploys it to Cloud Run.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "production: build, push and deploy to production (from main only)"
+        type: choice
+        options: [production]
+        default: production
+      commit:
+        description: "Full 40-char commit to build (e.g. the one staging runs); blank = HEAD"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write   # keyless GCP login (Workload Identity Federation)
+
+
+jobs:
+  build-staging:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      PROJECT: ${{ vars.STAGE_GCP_PROJECT_ID }}
+      REGION: ${{ vars.STAGE_GCP_REGION }}
+      IMAGE: ${{ vars.STAGE_GCP_REGION }}-docker.pkg.dev/${{ vars.STAGE_GCP_PROJECT_ID }}/${{ vars.STAGE_GAR_REPOSITORY }}/${{ vars.STAGE_IMAGE_NAME }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      publish: ${{ steps.cfg.outputs.publish }}
+    steps:
+      - name: Target settings
+        id: cfg
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          PUBLISH=false
+          [ "$GITHUB_REF" = refs/heads/develop ] && [ "$EVENT" = push ] && PUBLISH=true
+          printf 'publish=%s\nref=\ntag_prefix=develop\n' "$PUBLISH" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.cfg.outputs.ref }}
+          lfs: true   # lid9/models/lid.onnx
+
+      - name: Build
+        id: tag
+        run: |
+          docker build -t lid .
+          echo "tag=${{ steps.cfg.outputs.tag_prefix }}-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Run it the way Cloud Run does (port 8080, read-only, no capabilities)
+      # and identify a generated 2 s clip.
+      - name: Smoke test
+        run: |
+          python3 -c 'import wave, math, struct
+          w = wave.open("sample.wav", "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+          w.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * 220 * i / 16000))) for i in range(32000)))'
+          docker run -d --name lid --read-only --cap-drop=ALL -p 8080:8080 -e S2T_PORT=8080 lid
+          for i in $(seq 30); do curl -sf localhost:8080/health && break; sleep 2; done
+          curl -sf -F audio=@sample.wav localhost:8080/v1/identify | tee result.json
+          jq -e '.language | length > 0' result.json
+
+      # Auth, run the way production is configured: both STT token keys and the
+      # app-login public key set. STT tokens signed with either key and a
+      # ChatBucket app login (access) token are accepted; a wrong key, a
+      # refresh / pre-OTP token, one signed by another RSA key, or none -> 401.
+      - name: Token check
+        run: |
+          docker rm -f lid
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out app.pem 2>/dev/null
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out other.pem 2>/dev/null
+          # One line with escaped \n, the way Secret Manager holds it.
+          pub=$(openssl pkey -in app.pem -pubout | awk '{printf "%s\\n", $0}')
+          docker run -d --name lid-auth --read-only --cap-drop=ALL -p 8080:8080 \
+            -e S2T_PORT=8080 -e S2T_TOKEN_KEY=ci-app-key -e S2T_TOKEN_KEY_B2B=ci-b2b-key \
+            -e S2T_APP_TOKEN_PUBLIC_KEY="$pub" lid
+          for i in $(seq 30); do curl -sf localhost:8080/health && break; sleep 2; done
+          token() {
+            python3 -c 'import sys, hmac, hashlib, base64, json, time
+          b = lambda d: base64.urlsafe_b64encode(d).rstrip(b"=").decode()
+          h = b(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+          p = b(json.dumps({"aud": "stt", "exp": int(time.time()) + 300}).encode())
+          print(f"{h}.{p}." + b(hmac.new(sys.argv[1].encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()))' "$1"
+          }
+          rs256() {
+            python3 -c 'import sys, json, base64, time, subprocess
+          b = lambda d: base64.urlsafe_b64encode(d).rstrip(b"=").decode()
+          claims = dict(json.loads(sys.argv[2]), exp=int(time.time()) + 300)
+          si = b(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()) + "." + b(json.dumps(claims).encode())
+          sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", sys.argv[1]], input=si.encode(), capture_output=True, check=True).stdout
+          print(si + "." + b(sig))' "$1" "$2"
+          }
+          status() {
+            curl -s -o /dev/null -w '%{http_code}' -F audio=@sample.wav \
+              -H "Authorization: Bearer $1" localhost:8080/v1/identify
+          }
+          app=$(status "$(token ci-app-key)"); b2b=$(status "$(token ci-b2b-key)")
+          wrong=$(status "$(token wrong-key)"); none=$(status "")
+          login=$(status "$(rs256 app.pem '{"userId": "u1", "deviceId": "d1"}')")
+          refresh=$(status "$(rs256 app.pem '{"userId": "u1", "deviceId": "d1", "type": "refresh"}')")
+          preotp=$(status "$(rs256 app.pem '{"deviceId": "d1", "loginAttemptRecordId": "t1"}')")
+          forged=$(status "$(rs256 other.pem '{"userId": "u1", "deviceId": "d1"}')")
+          echo "STT app key: $app, B2B key: $b2b, wrong key: $wrong, no token: $none"
+          echo "app login: $login, refresh: $refresh, pre-OTP: $preotp, other RSA key: $forged"
+          test "$app" = 200 && test "$b2b" = 200 && test "$wrong" = 401 && test "$none" = 401
+          test "$login" = 200 && test "$refresh" = 401 && test "$preotp" = 401 && test "$forged" = 401
+
+      - name: SBOM (Syft)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: lid
+          format: spdx-json
+          output-file: sbom.spdx.json   # also kept as a run artifact
+
+      - name: Vulnerability scan (Grype)
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          sbom: sbom.spdx.json
+          only-fixed: true
+          severity-cutoff: critical
+          output-format: table
+
+      - name: Log in to GCP
+        if: steps.cfg.outputs.publish == 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ secrets.STAGE_GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.STAGE_GCP_DEPLOY_SA }}
+
+      - if: steps.cfg.outputs.publish == 'true'
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          project_id: ${{ env.PROJECT }}
+
+      # Tags are immutable in the repository, so a re-run for the same commit
+      # finds the image already there and skips the push.
+      - name: Push
+        if: steps.cfg.outputs.publish == 'true'
+        run: |
+          gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
+          REMOTE="${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}"
+          if gcloud artifacts docker images describe "$REMOTE" >/dev/null 2>&1; then
+            echo "$REMOTE already exists - not overwriting"
+          else
+            docker tag lid "$REMOTE" && docker push "$REMOTE"
+          fi
+
+  deploy-staging:
+    needs: build-staging
+    if: needs.build-staging.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    concurrency: deploy-cloudrun-staging   # one deploy at a time per target, never cancelled mid-rollout
+    env:
+      SERVICE: ${{ vars.STAGE_CLOUD_RUN_SERVICE }}
+      REGION: ${{ vars.STAGE_GCP_REGION }}
+      TAG: ${{ needs.build-staging.outputs.tag }}
+      IMAGE: ${{ vars.STAGE_GCP_REGION }}-docker.pkg.dev/${{ vars.STAGE_GCP_PROJECT_ID }}/${{ vars.STAGE_GAR_REPOSITORY }}/${{ vars.STAGE_IMAGE_NAME }}
+      HEALTH_URL: ${{ vars.STAGE_STT_HEALTH_URL }}
+      ALLOWED_ORIGIN: ${{ vars.STAGE_STT_ALLOWED_ORIGIN }}
+    steps:
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ secrets.STAGE_GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.STAGE_GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          project_id: ${{ vars.STAGE_GCP_PROJECT_ID }}
+
+      # Only the image changes - scaling, env, probes, LB and Cloud Armor are
+      # Terraform (gke-infra-terraform, modules/stt-cloudrun).
+      - name: Deploy
+        run: |
+          PREV=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.latestReadyRevisionName)')
+          echo "Current revision: $PREV"
+          gcloud run services update "$SERVICE" --region "$REGION" --image "$IMAGE:$TAG" --quiet
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-latest --quiet
+          echo "Deployed \`$IMAGE:$TAG\` to \`$SERVICE\` (previous revision \`$PREV\`)" >> "$GITHUB_STEP_SUMMARY"
+
+          [ -n "$HEALTH_URL" ] || exit 0   # no public URL configured yet (prod: until the DNS cutover)
+          for i in $(seq 12); do
+            curl -sf -H "Origin: $ALLOWED_ORIGIN" "$HEALTH_URL" && exit 0
+            sleep 5
+          done
+          echo "::error::health check failed - rolling back to $PREV"
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-revisions "$PREV=100" --quiet
+          exit 1
+
+  build-production:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      PROJECT: ${{ vars.PROD_GCP_PROJECT_ID }}
+      REGION: ${{ vars.PROD_GCP_REGION }}
+      IMAGE: ${{ vars.PROD_GCP_REGION }}-docker.pkg.dev/${{ vars.PROD_GCP_PROJECT_ID }}/${{ vars.PROD_GAR_REPOSITORY }}/${{ vars.PROD_IMAGE_NAME }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      publish: ${{ steps.cfg.outputs.publish }}
+    steps:
+      - name: Target settings
+        id: cfg
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main && "$GITHUB_REF" != refs/heads/master ]]; then
+            echo "::error::production runs from main/master only (this run: $GITHUB_REF_NAME)."; exit 1
+          fi
+          if [ -n "$COMMIT" ] && ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::commit must be a full 40-char sha"; exit 1
+          fi
+          printf 'publish=true\nref=%s\ntag_prefix=prod\n' "$COMMIT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.cfg.outputs.ref }}
+          lfs: true   # lid9/models/lid.onnx
+
+      - name: Build
+        id: tag
+        run: |
+          docker build -t lid .
+          echo "tag=${{ steps.cfg.outputs.tag_prefix }}-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Run it the way Cloud Run does (port 8080, read-only, no capabilities)
+      # and identify a generated 2 s clip.
+      - name: Smoke test
+        run: |
+          python3 -c 'import wave, math, struct
+          w = wave.open("sample.wav", "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+          w.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * 220 * i / 16000))) for i in range(32000)))'
+          docker run -d --name lid --read-only --cap-drop=ALL -p 8080:8080 -e S2T_PORT=8080 lid
+          for i in $(seq 30); do curl -sf localhost:8080/health && break; sleep 2; done
+          curl -sf -F audio=@sample.wav localhost:8080/v1/identify | tee result.json
+          jq -e '.language | length > 0' result.json
+
+      # Auth, run the way production is configured: both STT token keys and the
+      # app-login public key set. STT tokens signed with either key and a
+      # ChatBucket app login (access) token are accepted; a wrong key, a
+      # refresh / pre-OTP token, one signed by another RSA key, or none -> 401.
+      - name: Token check
+        run: |
+          docker rm -f lid
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out app.pem 2>/dev/null
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out other.pem 2>/dev/null
+          # One line with escaped \n, the way Secret Manager holds it.
+          pub=$(openssl pkey -in app.pem -pubout | awk '{printf "%s\\n", $0}')
+          docker run -d --name lid-auth --read-only --cap-drop=ALL -p 8080:8080 \
+            -e S2T_PORT=8080 -e S2T_TOKEN_KEY=ci-app-key -e S2T_TOKEN_KEY_B2B=ci-b2b-key \
+            -e S2T_APP_TOKEN_PUBLIC_KEY="$pub" lid
+          for i in $(seq 30); do curl -sf localhost:8080/health && break; sleep 2; done
+          token() {
+            python3 -c 'import sys, hmac, hashlib, base64, json, time
+          b = lambda d: base64.urlsafe_b64encode(d).rstrip(b"=").decode()
+          h = b(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+          p = b(json.dumps({"aud": "stt", "exp": int(time.time()) + 300}).encode())
+          print(f"{h}.{p}." + b(hmac.new(sys.argv[1].encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()))' "$1"
+          }
+          rs256() {
+            python3 -c 'import sys, json, base64, time, subprocess
+          b = lambda d: base64.urlsafe_b64encode(d).rstrip(b"=").decode()
+          claims = dict(json.loads(sys.argv[2]), exp=int(time.time()) + 300)
+          si = b(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()) + "." + b(json.dumps(claims).encode())
+          sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", sys.argv[1]], input=si.encode(), capture_output=True, check=True).stdout
+          print(si + "." + b(sig))' "$1" "$2"
+          }
+          status() {
+            curl -s -o /dev/null -w '%{http_code}' -F audio=@sample.wav \
+              -H "Authorization: Bearer $1" localhost:8080/v1/identify
+          }
+          app=$(status "$(token ci-app-key)"); b2b=$(status "$(token ci-b2b-key)")
+          wrong=$(status "$(token wrong-key)"); none=$(status "")
+          login=$(status "$(rs256 app.pem '{"userId": "u1", "deviceId": "d1"}')")
+          refresh=$(status "$(rs256 app.pem '{"userId": "u1", "deviceId": "d1", "type": "refresh"}')")
+          preotp=$(status "$(rs256 app.pem '{"deviceId": "d1", "loginAttemptRecordId": "t1"}')")
+          forged=$(status "$(rs256 other.pem '{"userId": "u1", "deviceId": "d1"}')")
+          echo "STT app key: $app, B2B key: $b2b, wrong key: $wrong, no token: $none"
+          echo "app login: $login, refresh: $refresh, pre-OTP: $preotp, other RSA key: $forged"
+          test "$app" = 200 && test "$b2b" = 200 && test "$wrong" = 401 && test "$none" = 401
+          test "$login" = 200 && test "$refresh" = 401 && test "$preotp" = 401 && test "$forged" = 401
+
+      - name: SBOM (Syft)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: lid
+          format: spdx-json
+          output-file: sbom.spdx.json   # also kept as a run artifact
+
+      - name: Vulnerability scan (Grype)
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          sbom: sbom.spdx.json
+          only-fixed: true
+          severity-cutoff: critical
+          output-format: table
+
+      - name: Log in to GCP
+        if: steps.cfg.outputs.publish == 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ secrets.PROD_GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.PROD_GCP_DEPLOY_SA }}
+
+      - if: steps.cfg.outputs.publish == 'true'
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          project_id: ${{ env.PROJECT }}
+
+      # Tags are immutable in the repository, so a re-run for the same commit
+      # finds the image already there and skips the push.
+      - name: Push
+        if: steps.cfg.outputs.publish == 'true'
+        run: |
+          gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
+          REMOTE="${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}"
+          if gcloud artifacts docker images describe "$REMOTE" >/dev/null 2>&1; then
+            echo "$REMOTE already exists - not overwriting"
+          else
+            docker tag lid "$REMOTE" && docker push "$REMOTE"
+          fi
+
+  deploy-production:
+    needs: build-production
+    if: needs.build-production.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: deploy-cloudrun-production   # one deploy at a time per target, never cancelled mid-rollout
+    env:
+      SERVICE: ${{ vars.PROD_CLOUD_RUN_SERVICE }}
+      REGION: ${{ vars.PROD_GCP_REGION }}
+      TAG: ${{ needs.build-production.outputs.tag }}
+      IMAGE: ${{ vars.PROD_GCP_REGION }}-docker.pkg.dev/${{ vars.PROD_GCP_PROJECT_ID }}/${{ vars.PROD_GAR_REPOSITORY }}/${{ vars.PROD_IMAGE_NAME }}
+      HEALTH_URL: ${{ vars.PROD_STT_HEALTH_URL }}
+      ALLOWED_ORIGIN: ${{ vars.PROD_STT_ALLOWED_ORIGIN }}
+    steps:
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ secrets.PROD_GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.PROD_GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          project_id: ${{ vars.PROD_GCP_PROJECT_ID }}
+
+      # Only the image changes - scaling, env, probes, LB and Cloud Armor are
+      # Terraform (gke-infra-terraform, modules/stt-cloudrun).
+      - name: Deploy
+        run: |
+          PREV=$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.latestReadyRevisionName)')
+          echo "Current revision: $PREV"
+          gcloud run services update "$SERVICE" --region "$REGION" --image "$IMAGE:$TAG" --quiet
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-latest --quiet
+          echo "Deployed \`$IMAGE:$TAG\` to \`$SERVICE\` (previous revision \`$PREV\`)" >> "$GITHUB_STEP_SUMMARY"
+
+          [ -n "$HEALTH_URL" ] || exit 0   # no public URL configured yet (prod: until the DNS cutover)
+          for i in $(seq 12); do
+            curl -sf -H "Origin: $ALLOWED_ORIGIN" "$HEALTH_URL" && exit 0
+            sleep 5
+          done
+          echo "::error::health check failed - rolling back to $PREV"
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-revisions "$PREV=100" --quiet
+          exit 1
