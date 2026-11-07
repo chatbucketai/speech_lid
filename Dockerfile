@@ -1,26 +1,20 @@
-# ---- Stage 1: Build ----
-FROM python:3.11-slim AS builder
-
-WORKDIR /build
-
+# Stage 1: install the Python packages (prebuilt wheels only) into /deps.
+FROM python:3.13-slim-trixie AS build
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --only-binary=:all: --target /deps -r requirements.txt \
+ && find /deps -depth -type d -name tests -exec rm -rf {} +
 
-COPY lid9/ ./lid9/
-
-# ---- Stage 2: Runtime ----
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsndfile1 \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY --from=builder /install /usr/local
-COPY --from=builder /build/lid9/ ./lid9/
-COPY server.py .
-
+# Stage 2: distroless Python 3.13 - no shell, no package manager, no pip,
+# runs as the non-root user 65532. The model ships inside lid9/models.
+FROM gcr.io/distroless/python3-debian13:nonroot
+ENV PYTHONPATH=/deps \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    S2T_PORT=8000
+COPY --from=build /deps /deps
+WORKDIR /srv
+COPY lid9/__init__.py ./lid9/
+COPY lid9/models/lid.onnx ./lid9/models/
+COPY auth.py server.py ./
 EXPOSE 8000
-
-CMD ["python", "server.py"]
+ENTRYPOINT ["python3", "server.py"]

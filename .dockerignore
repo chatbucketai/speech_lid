@@ -12,3 +12,8 @@ venv/
 .idea/
 .vscode/
 MANIFEST.txt
+.github
+tests/
+README.md
+*.wav
+.env
