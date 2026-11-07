@@ -17,6 +17,7 @@ lid9/
 └── models/
     └── lid.onnx     quantized model (13 MB)
 server.py            FastAPI HTTP server
+auth.py              bearer token check (same as the STT services)
 Dockerfile           multi-stage container build
 pyproject.toml       package metadata
 requirements.txt     pip dependencies
@@ -28,7 +29,7 @@ requirements.txt     pip dependencies
 
 ```bash
 docker build -t lid9 .
-docker run -p 8000:8000 lid9
+docker run -p 8000:8000 --read-only --cap-drop=ALL lid9
 ```
 
 ### Local
@@ -40,12 +41,16 @@ python server.py
 
 ## API
 
-### `POST /identify`
+### `POST /v1/identify`
+
+Needs `Authorization: Bearer <token>` - the same tokens the STT services accept
+(see auth.py). Deployed as Cloud Run service `stt-lid`, public at
+`https://<stt domain>/stt-lid/v1/identify`.
 
 Upload an audio file, get the language back.
 
 ```bash
-curl -X POST http://localhost:8000/identify \
+curl -X POST http://localhost:8000/v1/identify \
   -F "audio=@sample.wav"
 ```
 
@@ -108,3 +113,16 @@ lid9 --audio a.wav b.wav --json
 - `identify()` is thread-safe on one instance.
 - The hard cluster is Indo-Aryan (Hindi, Marathi, Gujarati, Bengali) —
   Dravidian languages separate easily.
+
+## Configuration
+
+| Env var | Default | Description |
+|---|---|---|
+| `S2T_PORT` | `8000` | listen port (Cloud Run: 8080) |
+| `S2T_DECODE_WORKERS` | `2` | onnxruntime threads |
+| `S2T_MAX_UPLOAD_MB` | `30` | upload limit |
+| `S2T_CORS_ORIGIN_REGEX` | empty | allowed browser origins |
+| `S2T_TOKEN_KEY`, `S2T_TOKEN_KEY_B2B` | empty | HS256 token keys |
+| `S2T_APP_TOKEN_PUBLIC_KEY` | empty | cb-backend RS256 public key |
+
+With no key set, every request is accepted (local use only).
